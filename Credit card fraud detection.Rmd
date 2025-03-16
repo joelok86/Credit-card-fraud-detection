@@ -1,0 +1,331 @@
+---
+title: "Credit card fraud detection"
+author: "Jyothi"
+date: "2025-03-15"
+output: pdf_document
+---
+
+```{r, warning=FALSE, message=FALSE}
+library(dplyr)
+library(tidyverse)
+library(janitor)
+library(xgboost)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(precrec)
+library(caret)
+```
+
+1. According to the Nilson report, credit cards transaction frauds will grow upto $400 billion in the next decade.
+Credit card fraud detection includes various anomaly detection, outlier modeling and predictive
+modeling to identify fraudulent transactions.
+Imbalanced data, with rare fraud transactions, evolving fraud techniques are few of the
+many challenges the credit card industry faces in fraud identification.
+
+2. The data set used in this analysis has been obtained from the Kaggle credit card fraud detection data.
+The observations include anonymized transactions from 2013 European cardholders.
+3.
+```{r}
+#Uploading the dataset onto R environment
+hw_data <- read.csv("C:\\Users\\jyoth\\Downloads\\archive\\creditcard.csv")
+```
+
+4. The data set contains transactions made by credit cards, and they are labelled as 
+fraudulent or genuine. 
+The columns include PCA values obtained from the original data inorder to reduce the dimensionality
+of the data. There are a total of 28 PCA columns with a mean of 0. The data also includes a time 
+column, amount column and a class column that has information on whether the observation 
+is fraud or genuine.
+The dataset has 284,807 rows and 31 columns in total, with no missing values.
+The PCA columns are labelled from V1 to V28.
+
+```{r}
+summary(hw_data)
+```
+
+5. The data variables are converted to PCA columns due to privacy restrictions. This helps in 
+reducing the dimensionality of the data, but it also poses the challenge of only being able to
+interpret the analysis results towards the respective PCA columns, and not the actual variables.
+The time column in the dataset includes the number of seconds passed since the first transaction
+in the dataset. For meaningful interpretation of this information, the date variable has been 
+converted to date and time, assuming the first transaction happened on 01-01-2013, at 00:00:00.
+The trends of the genuine vs fraud transactions by hour of the day has been plotted. The results
+indicate that, while the genuine transactions exhibit higher frequencies during the day,
+the frequency of fraud transactions remain more or less constant during all hours of the day.
+
+```{r}
+str(hw_data$Time)
+glimpse(hw_data)
+start_date <- as.POSIXct("2013-01-01 00:00:00", tz = "UTC")
+
+# Converting seconds to actual Date-Time format
+hw_data$Time <- start_date + hw_data$Time
+
+# Viewing the dataset
+glimpse(hw_data)
+```
+
+```{r}
+# Extracting hour information from Time variable
+hw_data$Hour <- hour(hw_data$Time)
+
+# Counting transactions per hour for each class
+hourly_trends <- hw_data %>%
+  group_by(Hour, Class) %>%
+  summarise(TransactionCount = n(), .groups = "drop")
+
+# Plotting the transaction volume by hour
+ggplot(hourly_trends, aes(x = Hour, y = TransactionCount, color = factor(Class))) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("blue", "red"), labels = c("Genuine", "Fraud")) +
+  labs(title = "Transactions by Hour of the Day",
+       x = "Hour of the Day",
+       y = "Transaction Count",
+       color = "Transaction Type") +
+  theme_minimal()
+```
+
+
+The maximum amount among fraudulent transactions is calculated.
+A line graph is plotted to understand the trends in the amount among fraudulent transactions.
+The data has been grouped by the amount in hundreds(rounding off to the lowest whole number), 
+and a graph has been plotted to visualize the trends in genuine versus 
+fraudulent transactions by amount. Majority of the fraud transactions are found to be below 500.
+Another graph is plotted to understand the trends observed in genuine transactions versus
+fraudulent transactions.
+
+```{r}
+hw_data %>%
+  filter(Class == 1) %>%
+  summarise(MaxAmount = max(Amount, na.rm = TRUE))
+
+
+fraud_trend <- hw_data %>% filter(Class==1) %>% arrange(Time)
+
+ggplot(data = fraud_trend, aes(x=Time, y=Amount))+
+  geom_line()
+```
+
+```{r}
+hw_data <- hw_data %>% mutate(spend_bin = floor(Amount/100)*100)
+
+spending_trends <- hw_data %>%
+  group_by(spend_bin, Class) %>%
+  summarise(TransactionCount = n(), .groups = "drop")
+
+# Plotting the trend using a line graph
+ggplot(spending_trends, aes(x = spend_bin, y = TransactionCount, color = factor(Class))) +
+  geom_line(size = 1.2) +  
+  geom_point(size = 2) +  
+  scale_color_manual(values = c("blue", "red"), labels = c("Genuine", "Fraud")) +
+  labs(title = "Transaction Trends by Amount",
+       x = "Transaction Amount (Binned in 100s)",
+       y = "Transaction Count",
+       color = "Transaction Type") +
+  theme_minimal()
+```
+
+
+6. The code identifies the principal components (PCs) that are most correlated
+with the "Class" variable, which indicates whether a credit card transaction is genuine
+or fraudulent. It calculates the correlation of each PC with the "Class" column, takes 
+the absolute values, and ranks them in descending order. The top 10 most correlated PCs 
+are then selected. Finally, a subset of the original dataset is created containing these 
+top 10 PCs along with the "Class" column.
+```{r}
+correlations <- sapply(hw_data[,2:29], function(x) cor(x, hw_data$Class, use="complete.obs"))
+
+cor_df <- data.frame(PC = names(correlations), Correlation = abs(correlations))
+
+cor_df <- cor_df[order(-cor_df$Correlation), ]
+
+print(cor_df[1:10, ])
+
+
+selected_pca <- hw_data %>% select(V17, V14, V12, V10, V16, V3, V7, V11, V4, V18,Class)
+```
+
+```{r}
+# Sorting by Class (Fraud cases first)
+sorted_pca <- selected_pca %>% arrange(desc(Class))
+
+# Checking first few rows to confirm sorting
+head(sorted_pca)
+```
+
+6. To build a fraud detection model, the XGBoost algorithm is used. 
+XGBoost is a powerful machine learning model known for its speed and accuracy in 
+classification tasks. The goal here is to train the model to distinguish between 
+fraudulent and genuine transactions based on numerical features extracted from PCA-transformed data.
+XGBoost improves upon decision trees by reducing overfitting and iteratively correcting misclassified points.
+Unlike Random Forest, XGBoost builds trees sequentially, focusing on errors from previous trees.
+
+First, the dataset is prepared by selecting the relevant features. 
+The Time column is removed, as it does not provide predictive power in this case. 
+The remaining columns are converted into a numerical matrix format,suitable for XGBoost. 
+The target variable, Class, which indicates whether a transaction is 
+fraud (1) or genuine (0), is extracted as a separate numeric vector.
+
+Seed is set, and the dataset is split into training and test data at 80:20 ratio.
+
+The XGBoost parameters are selected to optimize performance. 
+The objective function is set to binary:logistic.
+The evaluation metric chosen is AUC - Area Under the Curve, which is useful 
+for measuring model performance on imbalanced datasets. A learning rate (eta) of 0.1 is used 
+to control the rate at which the model learns from errors. The maximum depth of decision trees 
+is set to 6 to prevent overfitting. Subsample and colsample_bytree are set to 0.8, 
+ensuring that only a portion of the dataset and features are used in each tree to improve
+generalization.
+
+Once the dataset is converted into the appropriate XGBoost DMatrix format, the model is trained 
+for 100 boosting rounds. Each round updates the model to improve fraud detection accuracy while 
+minimizing misclassifications.
+
+Feature importance is analyzed to understand which variables contribute most to fraud detection. 
+The xgb.importance() function ranks the features, and the top 10 most important features are 
+visualized. This helps interpret the model’s decision-making process and identify the most 
+relevant factors in detecting fraudulent transactions.
+
+To assess how well the model performs, predictions are generated on the dataset. 
+Since XGBoost outputs probability scores, they are converted into binary predictions, 
+with a threshold of 0.5 used to classify transactions as either fraud or genuine.
+
+A confusion matrix is created to compare predicted values against actual values. 
+The confusion matrix provides insights into how many fraudulent transactions were 
+correctly identified (True Positives) and how many genuine transactions were incorrectly 
+classified as fraud (False Positives).
+
+Several key performance metrics are then calculated:
+  
+Accuracy measures the overall correctness of the model in predicting fraud and genuine transactions.
+Precision evaluates how many of the predicted fraudulent transactions were actually fraud.
+Recall determines how many of the actual fraudulent transactions were 
+successfully detected.
+F1-Score is the harmonic mean of Precision and Recall, providing a balanced measure of 
+model performance.
+The results of these metrics indicate how effectively the model identifies fraudulent transactions. 
+If precision is high but recall is low, it means the model is conservative in predicting fraud, 
+possibly missing some actual fraudulent transactions. Conversely, if recall is high but precision
+is low, the model flags too many genuine transactions as fraud.
+
+
+```{r}
+#Setting a seed for reproducibility
+set.seed(42)
+
+#Removing Time column
+hw_data1 <- hw_data %>% select(-Time)
+
+# Splitting data into training (80%) and test (20%)
+train_indices <- createDataPartition(hw_data1$Class, p = 0.8, list = FALSE)
+
+train_data <- hw_data1[train_indices, ]
+test_data  <- hw_data1[-train_indices, ]
+
+#Converting training and test Data into matrices for XGBoost
+train_features_matrix <- data.matrix(train_data %>% select(-Class))
+train_labels_vector <- as.numeric(train_data$Class)
+
+test_features_matrix <- data.matrix(test_data %>% select(-Class))
+test_labels_vector <- as.numeric(test_data$Class)
+
+#Converting to XGBoost DMatrix format
+dtrain <- xgb.DMatrix(data = train_features_matrix, label = train_labels_vector)
+dtest  <- xgb.DMatrix(data = test_features_matrix, label = test_labels_vector)
+
+#Defining XGBoost Parameters
+params <- list(
+  objective = "binary:logistic",  
+  eval_metric = "auc",            
+  eta = 0.1,                     
+  max_depth = 6,                 
+  subsample = 0.8,              
+  colsample_bytree = 0.8         
+)
+
+#Training XGBoost Model
+xgb_model <- xgb.train(params = params, data = dtrain, nrounds = 100)
+
+#Featuring Importance Plot
+importance_matrix <- xgb.importance(feature_names = colnames(train_features_matrix), model = xgb_model)
+xgb.plot.importance(importance_matrix, top_n = 10)
+
+#Making predictions on the Test Data
+test_predictions <- predict(xgb_model, dtest)
+
+#Converting probabilities into binary labels
+predicted_test_labels <- ifelse(test_predictions > 0.5, 1, 0)
+
+#Creating confusion matrix
+confusion_matrix <- table(predicted_test_labels, test_labels_vector)
+print(confusion_matrix)
+
+#computing model performance metrics
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+print(paste("Accuracy:", round(accuracy, 4)))
+
+precision <- confusion_matrix[2,2] / sum(confusion_matrix[,2])
+print(paste("Precision:", round(precision, 4)))
+
+recall <- confusion_matrix[2,2] / sum(confusion_matrix[2,])
+print(paste("Recall:", round(recall, 4)))
+
+f1_score <- 2 * (precision * recall) / (precision + recall)
+print(paste("F1-Score:", round(f1_score, 4)))
+```
+8. To further analyze the model’s effectiveness, various visualizations are created.
+
+Feature importance plot
+The first visualization highlights the most important features in the dataset that influence fraud detection. 
+The xgb.plot.importance() function is used to display the top 10 features ranked by their contribution to the model. 
+This allows us to understand which PCA-transformed variables play a crucial role in predicting fraudulent activity.
+
+Boxplot of an important feature
+A boxplot is created to visualize how one of the most influential features (e.g., V17) varies between genuine 
+and fraudulent transactions. This plot shows the distribution of this feature for fraud and non-fraud transactions, 
+helping us see whether fraudulent transactions exhibit distinct patterns compared to genuine transactions.
+
+Confusion Matrix heatmap
+The confusion matrix is visualized as a heatmap, where the intensity of colors represents the number of 
+correctly and incorrectly classified transactions. The diagonal of the heatmap represents correct predictions, 
+while off-diagonal elements indicate misclassified transactions. 
+A high number of false positives (genuine transactions wrongly flagged as fraud) can impact the customer experience,
+while a high number of false negatives (fraud that was missed) can result in financial losses.
+
+
+```{r}
+#visualization of feature importance
+xgb.plot.importance(importance_matrix, top_n = 10)
+
+#Boxplot for one important feature
+top_feature <- "V17"
+ggplot(hw_data, aes(x = as.factor(Class), y = get(top_feature), fill = as.factor(Class))) +
+  geom_boxplot() +
+  labs(title = paste("Feature:", top_feature, " vs. Fraud"), x = "Fraud (Class)", y = top_feature) +
+  theme_minimal()
+
+#confusion matrix heatmap
+cm_df <- as.data.frame(as.table(confusion_matrix))
+ggplot(cm_df, aes(x = predicted_test_labels, y = test_labels_vector, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white", size = 6) +
+  labs(title = "Confusion Matrix Heatmap", x = "Predicted", y = "Actual") +
+  scale_fill_gradient(low = "blue", high = "red") +
+  theme_minimal()
+```
+
+7. Results:
+  
+
+The analysis identifies V17 as the top strongly correlated PCA feature with the class column, showing a 
+correlation of 0.32. The XGBoost model exhibited high specificity (99%), correctly identifying the majority 
+of genuine transactions, with only 21 false positives. However, it misclassified 2 fraudulent transactions, 
+resulting in a sensitivity of 79%, indicating that some fraud cases were missed. The overall model accuracy 
+reached 99%, demonstrating strong performance in distinguishing between fraud and genuine transactions. 
+Precision was measured at 79%, showing the proportion of correctly identified fraud cases among all fraud
+predictions. The model achieved a recall of 96%, meaning it can successfully detect
+the majority of actual fraud cases. The F1-score, which balances precision and recall, was 87%, highlighting 
+the model’s effectiveness in handling fraud detection within an imbalanced dataset.
+The boxplot comparing Feature V17 with fraudulent and genuine transactions reveals distinct patterns. Fraudulent transactions exhibit a lower median V17 value, with most values below zero and a wider interquartile range, indicating greater variability. In contrast, genuine transactions have a median closer to zero, a narrower distribution, and several outliers. This suggests that negative values of V17 are more indicative of fraud, making it a valuable predictor in fraud detection. The presence of outliers in genuine transactions could indicate potential false positives, warranting further investigation.The confusion matrix shows the distribution of the actual and predicted values.
